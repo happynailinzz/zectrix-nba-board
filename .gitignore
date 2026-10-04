@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+*.py[cod]
+*.log
+*.png
+
+# Zectrix device credentials and runtime state stay outside the repository.
+config.json
+cache/
