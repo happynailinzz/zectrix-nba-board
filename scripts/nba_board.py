@@ -25,6 +25,12 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 BASE = "https://cloud.zectrix.com/open/v1"
 SCOREBOARD = os.environ.get("NBA_SCOREBOARD_URL", "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json")
 SCHEDULE = os.environ.get("NBA_SCHEDULE_URL", "https://cdn.nba.com/static/json/staticData/scheduleLeagueV2_1.json")
+# Third-party primary source. ESPN's public scoreboard endpoint is key-free and
+# reachable from US datacenter egress where cdn.nba.com is Akamai-blocked. It
+# accepts ?dates=YYYYMMDD, so it covers the -1..+2 day window collect() needs.
+# Set NBA_SCORE_SOURCE=espn (default) or =official to force a specific source.
+ESPN_SCOREBOARD = os.environ.get("NBA_ESPN_SCOREBOARD_URL", "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard")
+SCORE_SOURCE = os.environ.get("NBA_SCORE_SOURCE", "espn").strip().lower()
 SINA_NEWS = "https://sports.sina.com.cn/nba/"
 TENCENT_NEWS = "https://sports.qq.com/nba/"
 TZ = ZoneInfo("Asia/Shanghai")
@@ -37,6 +43,13 @@ TEAM_ZH = {
     "OKC": "雷霆", "ORL": "魔术", "PHI": "76人", "PHX": "太阳", "POR": "开拓者",
     "SAC": "国王", "SAS": "马刺", "TOR": "猛龙", "UTA": "爵士", "WAS": "奇才",
 }
+# ESPN's scoreboard uses a few non-standard team codes; normalize them to the
+# official tricode before the TEAM_ZH lookup so the Chinese names resolve.
+ESPN_CODE_ALIAS = {"GS": "GSW", "NO": "NOP", "NY": "NYK", "UTAH": "UTA", "PHI": "PHI"}
+
+
+def _esp_code(code):
+    return ESPN_CODE_ALIAS.get(code, code)
 
 
 class NewsParser(HTMLParser):
@@ -130,12 +143,59 @@ def fetch_json(url):
         return json.loads(response.read().decode("utf-8"))
 
 
+def _zh_count(text):
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+_NEWS_IGNORED = ("首页", "登录", "注册", "更多", "视频", "图片", "评论", "分享",
+                 "排行", "直播", "数据", "资料", "专题", "收藏", "阅读",
+                 "意见反馈", "招募", "广告")
+
+
+def _regex_news(html_text):
+    """Extract real Chinese headline links from a Sina-style NBA listing page.
+
+    The page's live article links all carry a recognizable path (``/doc-``,
+    a ``YYYY-MM-DD`` date segment, or a ``/k/`` opinion column) and a Chinese
+    title of at least a few characters. This is far more reliable than the
+    class-based NewsParser, which matches nothing on Sina's current markup.
+    Returns an ordered, de-duplicated list of headline strings.
+    """
+    found = []
+    seen = set()
+    for attrs, text in re.findall(r'<a\s+([^>]*href="[^"]+")>([^<{}]{8,60})</a>', html_text):
+        title = html.unescape(text).strip()
+        if _zh_count(title) < 4:
+            continue
+        if any(word in title for word in _NEWS_IGNORED):
+            continue
+        href = re.search(r'href="([^"]*)"', attrs)
+        href = href.group(1) if href else ""
+        if not re.search(r"/doc-|/k/|\d{4}-\d{2}-\d{2}/", href):
+            continue
+        if title in seen:
+            continue
+        seen.add(title)
+        found.append(title)
+    return found
+
+
 def fetch_html(url):
-    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 zectrix-nba-board/1.0", "Accept": "text/html"})
+    browser_ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+    request = urllib.request.Request(url, headers={
+        "User-Agent": browser_ua,
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+    })
     with urllib.request.urlopen(request, timeout=15) as response:
+        html_text = response.read().decode("utf-8", "ignore")
+    items = _regex_news(html_text)
+    if not items:
         parser = NewsParser()
-        parser.feed(response.read().decode("utf-8", "ignore"))
-        return parser.items
+        parser.feed(html_text)
+        items = parser.items
+    return items
 
 
 def cache_json(name, value):
@@ -155,10 +215,10 @@ def read_cache(name, default):
         return default
 
 
-def safe_fetch(label, url, default):
+def safe_fetch(label, fetcher, default):
     for attempt in range(2):
         try:
-            return fetch_json(url)
+            return fetcher()
         except (OSError, ValueError, KeyError, urllib.error.URLError) as error:
             if attempt:
                 print("WARN: %s 数据源失败：%s" % (label, error), file=sys.stderr)
@@ -252,20 +312,79 @@ def sample_data(start):
     }
 
 
+def parse_espn_games(data, local_date):
+    """Parse ESPN's public scoreboard JSON into the same game dict shape as
+    parse_games(), so build_state()/render() need no changes. ESPN source is
+    key-free and reachable from US datacenter egress where cdn.nba.com is
+    Akamai-blocked."""
+    games = []
+    for event in data.get("events", []):
+        competition = (event.get("competitions") or [{}])[0]
+        status = competition.get("status", {}) or {}
+        state = {"in": "live", "post": "final"}.get((status.get("type", {}) or {}).get("state", "pre"), "scheduled")
+        competitors = competition.get("competitors", [])
+        away = next((c for c in competitors if c.get("homeAway") == "away"), {})
+        home = next((c for c in competitors if c.get("homeAway") == "home"), away)
+        away_code = _esp_code((away.get("team") or {}).get("abbreviation", "客队"))
+        home_code = _esp_code((home.get("team") or {}).get("abbreviation", "主队"))
+        away_score = away.get("score", "-")
+        home_score = home.get("score", "-")
+        start = event.get("date", "")
+        if state == "scheduled":
+            try:
+                when = dt.datetime.fromisoformat(start.replace("Z", "+00:00")).astimezone(TZ).strftime("%H:%M")
+            except ValueError:
+                when = "待定"
+            status_text = when
+        elif state == "live":
+            period = status.get("period", 0) or 1
+            clock = (status.get("displayClock") or "").strip()
+            status_text = "中场休息" if clock in ("", "0.0") else "%s节 · 剩余 %s" % (period, clock)
+        else:
+            status_text = "已结束"
+        games.append({
+            "away": TEAM_ZH.get(away_code, away_code), "home": TEAM_ZH.get(home_code, home_code),
+            "away_code": away_code, "home_code": home_code,
+            "away_score": away_score, "home_score": home_score,
+            "status": status_text, "state": state, "start": start,
+        })
+    return {"date": local_date.isoformat(), "games": games}
+
+
 def collect(date, offline=False):
     if offline:
         return sample_data(date)
     days = []
-    for offset in range(-1, 3):
-        day = date + dt.timedelta(offset)
-        query = urllib.parse.urlencode({"dates": day.strftime("%Y%m%d")})
-        if offset == 0:
-            data = cached_fetch("NBA官方赛程", SCOREBOARD, "scoreboard.json", {})
-            days.append(parse_games(data, day))
-        else:
-            schedule = cached_fetch("NBA官方未来赛程", SCHEDULE, "schedule.json", {})
-            schedule_games = parse_games(schedule, day)
-            days.append({"date": day.isoformat(), "games": [game for game in schedule_games["games"] if game.get("start", "").startswith(day.isoformat())]})
+    if SCORE_SOURCE == "espn":
+        # NBA games land on the US date they start, but a Beijing calendar day
+        # spans two US dates (US evening == Beijing morning). So fetch a window
+        # of US dates, then re-bucket every game by its Beijing-time start date.
+        # For a target Beijing day D we need US days D-1 and D, hence the range.
+        by_date = {}
+        for k in range(-2, 3):
+            us_day = date + dt.timedelta(k)
+            url = "%s?dates=%s" % (ESPN_SCOREBOARD, us_day.strftime("%Y%m%d"))
+            data = cached_fetch("ESPN赛程", url, "espn-%s.json" % us_day.isoformat(), {})
+            for game in parse_espn_games(data, us_day)["games"]:
+                try:
+                    bj_date = dt.datetime.fromisoformat(game["start"].replace("Z", "+00:00")).astimezone(TZ).date()
+                except (ValueError, TypeError):
+                    bj_date = date  # live/unknown -> fold into today
+                by_date.setdefault(bj_date.isoformat(), []).append(game)
+        for offset in range(-1, 3):
+            target = (date + dt.timedelta(offset)).isoformat()
+            days.append({"date": target, "games": by_date.get(target, [])})
+    else:
+        for offset in range(-1, 3):
+            day = date + dt.timedelta(offset)
+            query = urllib.parse.urlencode({"dates": day.strftime("%Y%m%d")})
+            if offset == 0:
+                data = cached_fetch("NBA官方赛程", SCOREBOARD, "scoreboard.json", {})
+                days.append(parse_games(data, day))
+            else:
+                schedule = cached_fetch("NBA官方未来赛程", SCHEDULE, "schedule.json", {})
+                schedule_games = parse_games(schedule, day)
+                days.append({"date": day.isoformat(), "games": [game for game in schedule_games["games"] if game.get("start", "").startswith(day.isoformat())]})
     sina = parse_chinese_news(cached_fetch("新浪NBA新闻", SINA_NEWS, "sina-news.json", [], html_mode=True), "新浪体育")
     tencent = parse_chinese_news(cached_fetch("腾讯NBA新闻", TENCENT_NEWS, "tencent-news.json", [], html_mode=True), "腾讯体育")
     news = (sina + tencent)[:3]
