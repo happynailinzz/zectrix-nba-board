@@ -481,7 +481,7 @@ def render(data, date, output, now=None):
         draw_left_centered(draw, (44, 84, 356, 105), label, detail_font, black, 312)
         finals = state["recent_finals"]
         band_top, band_bottom = 112, 198
-        row_h = 34
+        row_h = {1: 44, 2: 38, 3: 28}.get(len(finals), 28)
         block_h = row_h * len(finals)
         row_top = band_top + max(0, (band_bottom - band_top - block_h) // 2)
         for index, game in enumerate(finals):
