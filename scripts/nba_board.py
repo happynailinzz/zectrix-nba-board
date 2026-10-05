@@ -456,9 +456,10 @@ def render(data, date, output, now=None):
     team_font = font(17)
     code_font = font(11)
     score_font = font(27)
-    detail_font = font(12)
+    detail_font = font(13)
     small = font(11)
-    tiny = font(10)
+    result_team = font(15)
+    result_score = font(20)
     draw.rounded_rectangle((12, 12, 388, 288), radius=2, outline=black, width=2)
     logo = nba_logo()
     image.alpha_composite(logo, (18, 15)) if image.mode == "RGBA" else image.paste(logo.convert("L"), (18, 15), logo.getchannel("A"))
@@ -476,18 +477,23 @@ def render(data, date, output, now=None):
     type_text = "今日无比赛" if status == "REST" else "常规赛"
     draw_left_centered(draw, (310, 51, 380, 73), type_text, small, gray, 70)
     if status in {"FINAL", "REST"} and state["recent_finals"]:
-        label = "今日赛果" if status == "FINAL" else "最近比赛日赛果"
+        label = "今日赛果 · 共 %d 场" % len(state["recent_finals"]) if status == "FINAL" else "最近比赛日 · 共 %d 场" % len(state["recent_finals"])
         draw_left_centered(draw, (44, 84, 356, 105), label, detail_font, black, 312)
-        for index, game in enumerate(state["recent_finals"]):
-            row_top = 108 + index * 27
-            away = fit(draw, game.get("away"), small, 80)
-            home = fit(draw, game.get("home"), small, 80)
+        finals = state["recent_finals"]
+        band_top, band_bottom = 112, 198
+        row_h = 34
+        block_h = row_h * len(finals)
+        row_top = band_top + max(0, (band_bottom - band_top - block_h) // 2)
+        for index, game in enumerate(finals):
+            y = row_top + index * row_h
+            away = fit(draw, game.get("away"), result_team, 88)
+            home = fit(draw, game.get("home"), result_team, 88)
             score = "%s : %s" % (game.get("away_score", "-"), game.get("home_score", "-"))
-            draw_left_centered(draw, (44, row_top, 145, row_top + 21), away, small, black, 101)
-            draw.text((200, row_top + 10), score, font=detail_font, fill=black, anchor="mm")
-            draw_right_centered(draw, (255, row_top, 356, row_top + 21), home, small, black, 101)
-        footer = "最近 1 个比赛日 · 共 %d 场" % len(state["recent_finals"])
-        draw.text((200, 190), footer, font=tiny, fill=gray, anchor="mm")
+            draw_left_centered(draw, (44, y, 152, y + row_h - 4), away, result_team, black, 108)
+            draw.text((200, y + (row_h - 4) / 2), score, font=result_score, fill=black, stroke_width=1, anchor="mm")
+            draw_right_centered(draw, (248, y, 356, y + row_h - 4), home, result_team, black, 108)
+            if index < len(finals) - 1:
+                draw.line((44, y + row_h - 2, 356, y + row_h - 2), fill=gray, width=1)
     elif focus:
         draw_left_centered(draw, (44, 84, 136, 108), focus.get("away"), team_font, black, 92)
         draw_left_centered(draw, (44, 111, 136, 130), focus.get("away_code", "客"), code_font, gray, 92)
