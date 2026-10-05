@@ -514,10 +514,20 @@ def render(data, date, output, now=None):
         aux = "NEXT  %s · 今日还有 %d 场" % (next_games[0].get("status", "待定") if next_games else "暂无", len(next_games))
     elif status == "NEXT":
         aux = "TODAY  已结束 %d 场 · 下一场后还有 %d 场" % (sum(g["state"] == "final" for g in state["today"]), max(0, len(state["today"]) - 1))
-    elif status == "FINAL":
-        aux = "NEXT  明日 · %s" % (state["future"][0].get("status", "待定") if state["future"] else "暂无赛程")
     else:
-        aux = "NEXT  明日 · %s" % (state["future"][0].get("status", "待定") if state["future"] else "暂无赛程")
+        # FINAL / REST: NEXT 行补全为「下一比赛日标签 · 开赛时间 · 共 N 场」，
+        # 场次按北京开赛日分桶（data["days"] 的 date 即北京日），避免 UTC 串跨界误计。
+        next_day = next((day for day in sorted((d for d in data["days"] if d["date"] > date.isoformat()), key=lambda d: d["date"]) if day.get("games")), None)
+        if next_day:
+            nd = dt.date.fromisoformat(next_day["date"])
+            label = {1: "明日", 2: "后天"}.get((nd - date).days, nd.strftime("%m-%d"))
+            def _start_key(game):
+                s = game.get("status", "")
+                return s if re.match(r"^\d{1,2}:\d{2}$", s) else "99:99"
+            first = min(next_day["games"], key=_start_key)
+            aux = "NEXT  %s · %s · 共 %d 场" % (label, first.get("status", "待定"), len(next_day["games"]))
+        else:
+            aux = "NEXT  暂无后续赛程"
     draw_left_centered(draw, (22, 206, 378, 250), aux, detail_font, black, 356)
     draw.line((14, 250, 386, 250), fill=black, width=1)
     news = (data.get("news") or [{}])[0]
