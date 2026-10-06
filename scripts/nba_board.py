@@ -33,6 +33,13 @@ ESPN_SCOREBOARD = os.environ.get("NBA_ESPN_SCOREBOARD_URL", "https://site.api.es
 SCORE_SOURCE = os.environ.get("NBA_SCORE_SOURCE", "espn").strip().lower()
 SINA_NEWS = "https://sports.sina.com.cn/nba/"
 TENCENT_NEWS = "https://sports.qq.com/nba/"
+# Live Sina NBA feed (the AJAX endpoint behind the page's "最新资讯" panel):
+# newest-first items with ctime. The static HTML listing is much older
+# (hot articles from weeks ago), so the feed is the primary news source;
+# the static pages only act as fallback when the endpoint dies.
+SINA_FEED = os.environ.get("NBA_SINA_FEED_URL", "https://interface.sina.cn/sports/pc_sports_caipiao_common_list_api.d.json?ename=nba&last_ts=&page=1&size=20")
+_NON_NBA_KEYWORDS = ("网球", "足球", "英超", "西甲", "德甲", "意甲", "欧冠",
+                     "棒球", "高尔夫", "赛车", "ATP", "WTA", "F1")
 TZ = ZoneInfo("Asia/Shanghai")
 CACHE_DIR = os.environ.get("ZECTRIX_NBA_CACHE_DIR", os.path.expanduser("~/.cache/zectrix-nba-board"))
 TEAM_ZH = {
@@ -159,10 +166,14 @@ def _regex_news(html_text):
     a ``YYYY-MM-DD`` date segment, or a ``/k/`` opinion column) and a Chinese
     title of at least a few characters. This is far more reliable than the
     class-based NewsParser, which matches nothing on Sina's current markup.
-    Returns an ordered, de-duplicated list of headline strings.
+    Returns de-duplicated headline strings, newest-first: the date embedded
+    in the article URL orders the pool so fresher news ranks ahead of older
+    items.
     """
     found = []
     seen = set()
+    dated = []
+    undated = []
     for attrs, text in re.findall(r'<a\s+([^>]*href="[^"]+")>([^<{}]{8,60})</a>', html_text):
         title = html.unescape(text).strip()
         if _zh_count(title) < 4:
@@ -176,7 +187,10 @@ def _regex_news(html_text):
         if title in seen:
             continue
         seen.add(title)
-        found.append(title)
+        date = re.search(r"(\d{4}-\d{2}-\d{2})", href)
+        (dated if date else undated).append((date.group(1) if date else "", title))
+    dated.sort(key=lambda item: item[0], reverse=True)
+    found.extend(title for _, title in dated + undated)
     return found
 
 
@@ -196,6 +210,43 @@ def fetch_html(url):
         parser.feed(html_text)
         items = parser.items
     return items
+
+
+def _feed_titles(data):
+    """Extract de-duplicated, NBA-relevant titles (newest-first) from a Sina
+    feed response dict. Non-basketball items (网球/足球/ATP/WTA/F1 ...) are
+    dropped so the hot-news slot stays on NBA."""
+    titles = []
+    seen = set()
+    for item in ((data.get("result") or {}).get("data") or {}).get("items") or []:
+        title = html.unescape(str(item.get("title") or "")).strip()
+        if _zh_count(title) < 4:
+            continue
+        if any(word in title for word in _NON_NBA_KEYWORDS):
+            continue
+        if title in seen:
+            continue
+        seen.add(title)
+        titles.append(title)
+    return titles
+
+
+def fetch_sina_feed(url):
+    """Fetch Sina's live NBA news feed (newest-first, seconds-old items).
+
+    Returns a de-duplicated title list, or an empty list when the endpoint
+    has no usable items so the caller can fall back to the static pages.
+    """
+    browser_ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0 Safari/537.36")
+    request = urllib.request.Request(url, headers={
+        "User-Agent": browser_ua,
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://sports.sina.com.cn/nba/",
+    })
+    with urllib.request.urlopen(request, timeout=15) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    return _feed_titles(data)
 
 
 def cache_json(name, value):
@@ -385,9 +436,25 @@ def collect(date, offline=False):
                 schedule = cached_fetch("NBA官方未来赛程", SCHEDULE, "schedule.json", {})
                 schedule_games = parse_games(schedule, day)
                 days.append({"date": day.isoformat(), "games": [game for game in schedule_games["games"] if game.get("start", "").startswith(day.isoformat())]})
-    sina = parse_chinese_news(cached_fetch("新浪NBA新闻", SINA_NEWS, "sina-news.json", [], html_mode=True), "新浪体育")
-    tencent = parse_chinese_news(cached_fetch("腾讯NBA新闻", TENCENT_NEWS, "tencent-news.json", [], html_mode=True), "腾讯体育")
-    news = (sina + tencent)[:3]
+    feed = cached_fetch("新浪NBA实时资讯", SINA_FEED, "sina-feed.json", {})
+    feed_titles = _feed_titles(feed)
+    if feed_titles:
+        pool = [{"title": title, "source": "新浪体育", "age": ""} for title in feed_titles]
+    else:
+        # Endpoint died or returned nothing usable: fall back to the static
+        # Sina listing (hot articles, older) and Tencent, exactly as before.
+        sina = parse_chinese_news(cached_fetch("新浪NBA新闻", SINA_NEWS, "sina-news.json", [], html_mode=True), "新浪体育")
+        tencent = parse_chinese_news(cached_fetch("腾讯NBA新闻", TENCENT_NEWS, "tencent-news.json", [], html_mode=True), "腾讯体育")
+        pool = sina + tencent
+    if offline or not pool:
+        news = pool
+    else:
+        # Round-robin the pool (newest-first) so a different headline shows on
+        # each real refresh instead of pinning the top item for the whole poll
+        # interval. The index survives restarts.
+        index = (read_cache("news-index.json", -1) + 1) % len(pool)
+        cache_json("news-index.json", index)
+        news = pool[index:] + pool[:index]
     return {"days": days, "news": news}
 
 
